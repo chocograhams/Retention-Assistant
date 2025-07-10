@@ -1,0 +1,8 @@
+streamlit
+sentence-transformers
+pdfplumber
+python-docx
+pytesseract
+Pillow
+docx2txt
+pymupdf
