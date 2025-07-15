@@ -9,19 +9,20 @@ import tempfile
 import datetime
 from sentence_transformers import SentenceTransformer, util
 from PIL import Image
-import io
 import zipfile
-from xml.etree import ElementTree as ET
 
 st.set_page_config(page_title="📁 Washington Records Retention Assistant")
 st.title("📁 Washington Records Retention Assistant")
+
 
 # Load embedding model
 @st.cache_resource
 def load_embedding_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
+
 model = load_embedding_model()
+
 
 # Extract retention rules from PDF
 def extract_retention_from_pdf(pdf_file):
@@ -42,6 +43,7 @@ def extract_retention_from_pdf(pdf_file):
                         })
     return pd.DataFrame(rules)
 
+
 # Extract text from various file types
 def extract_text(uploaded_file):
     if uploaded_file.name.endswith(".pdf"):
@@ -49,10 +51,9 @@ def extract_text(uploaded_file):
             return "\n".join([page.get_text() for page in doc])
     elif uploaded_file.name.endswith(".docx"):
         text = docx2txt.process(uploaded_file)
-        if text.strip():  # If actual text exists
+        if text.strip():
             return text
-
-        # OCR fallback: extract images from .docx and run OCR
+        # OCR fallback
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = os.path.join(tmpdir, uploaded_file.name)
             with open(tmp_path, "wb") as f:
@@ -74,8 +75,31 @@ def extract_text(uploaded_file):
     else:
         return ""
 
+
+# Load feedback CSV
+def load_feedback():
+    if os.path.exists("feedback_log.csv"):
+        return pd.read_csv("feedback_log.csv")
+    return pd.DataFrame()
+
+
 # Match document text to best retention category
-def match_retention(text, rules_df):
+def match_retention(text, rules_df, feedback_df=None):
+    cleaned_text = text.strip()
+
+    # Lookup override
+    if feedback_df is not None and not feedback_df.empty:
+        matched = feedback_df[feedback_df["document_text"] == cleaned_text]
+        if not matched.empty:
+            row = matched.iloc[-1]  # Use most recent feedback
+            return {
+                "category": row["override_category"],
+                "description": "User-verified category (from feedback)",
+                "retention": row["override_retention"],
+                "score": 1.0
+            }
+
+    # Fallback to embedding similarity
     doc_embedding = model.encode(text, convert_to_tensor=True)
     rule_embeddings = model.encode(rules_df['category_description'].tolist(), convert_to_tensor=True)
     similarities = util.cos_sim(doc_embedding, rule_embeddings)[0]
@@ -87,6 +111,7 @@ def match_retention(text, rules_df):
         "score": float(similarities[top_idx])
     }
 
+
 # Confidence level mapping
 def get_confidence_level(score):
     if score >= 0.8:
@@ -96,17 +121,34 @@ def get_confidence_level(score):
     else:
         return "Low", "🔴 Low (< 0.60): Needs review"
 
-# Upload and parse retention schedule
+
+# Save feedback entries to CSV
+def save_feedback_to_csv(entry, csv_path="feedback_log.csv"):
+    if os.path.exists(csv_path):
+        df_existing = pd.read_csv(csv_path)
+        df_new = pd.concat([df_existing, pd.DataFrame([entry])], ignore_index=True)
+    else:
+        df_new = pd.DataFrame([entry])
+    df_new.to_csv(csv_path, index=False)
+
+
+# Upload retention schedule
 retention_file = st.file_uploader("📎 Upload a Retention Schedule (PDF)", type="pdf")
 if retention_file:
     retention_df = extract_retention_from_pdf(retention_file)
     st.success(f"✅ Retention schedule '{retention_file.name}' loaded with {len(retention_df)} categories.")
 
-    # Upload multiple documents
-    uploaded_files = st.file_uploader("📄 Upload Documents to Classify (PDF, DOCX, TXT, Images)", type=["pdf", "docx", "txt", "png", "jpg"], accept_multiple_files=True)
+    # Load prior feedback
+    feedback_df = load_feedback()
+
+    # Upload documents
+    uploaded_files = st.file_uploader(
+        "📄 Upload Documents to Classify (PDF, DOCX, TXT, Images)",
+        type=["pdf", "docx", "txt", "png", "jpg"],
+        accept_multiple_files=True
+    )
 
     if uploaded_files:
-        log_entries = []
         for uploaded_file in uploaded_files:
             with st.expander(f"📄 Document: {uploaded_file.name}", expanded=True):
                 text = extract_text(uploaded_file)
@@ -114,8 +156,11 @@ if retention_file:
                     st.warning("⚠️ No readable text found.")
                     continue
 
-                match = match_retention(text, retention_df)
-                level, definition = get_confidence_level(match['score'])
+                match = match_retention(text, retention_df, feedback_df)
+                level, definition = get_confidence_level(match["score"])
+
+                if match["description"].startswith("User-verified"):
+                    st.markdown("✅ **Matched from previous feedback**")
 
                 st.markdown(f"**Suggested Category**: {match['category']}")
                 st.markdown(f"**Retention Period**: {match['retention']}")
@@ -123,60 +168,60 @@ if retention_file:
                 st.markdown(f"**Confidence Level**: {definition}")
                 st.markdown(f"**Schedule Used**: {retention_file.name}")
 
-                confirm_key = f"confirm_{uploaded_file.name}"
-                edit_key = f"edit_{uploaded_file.name}"
+                # Inputs to allow edits
+                override_category = st.text_input(
+                    "Override Category",
+                    value=match["category"],
+                    key=f"cat_{uploaded_file.name}"
+                )
+                override_retention = st.text_input(
+                    "Override Retention Period",
+                    value=match["retention"],
+                    key=f"ret_{uploaded_file.name}"
+                )
 
                 col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("✅ Confirm", key=confirm_key):
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        log_entries.append({
-                            "timestamp": timestamp,
-                            "document": uploaded_file.name,
-                            "predicted_category": match['category'],
-                            "predicted_retention": match['retention'],
-                            "override_category": match['category'],
-                            "override_retention": match['retention'],
-                            "confidence_level": level,
-                            "confidence_score": match['score'],
-                            "retention_schedule": retention_file.name
-                        })
-                        st.success(f"💾 Confirmed and saved for {uploaded_file.name}")
+                if col1.button("✅ Confirm", key=f"confirm_{uploaded_file.name}"):
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    feedback_entry = {
+                        "timestamp": timestamp,
+                        "document": uploaded_file.name,
+                        "document_text": text.strip(),
+                        "original_category": match["category"],
+                        "original_retention": match["retention"],
+                        "override_category": match["category"],
+                        "override_retention": match["retention"],
+                        "confidence_level": level,
+                        "confidence_score": match["score"],
+                        "retention_schedule": retention_file.name
+                    }
+                    save_feedback_to_csv(feedback_entry)
+                    st.success(f"✅ Confirmed and saved for {uploaded_file.name}")
 
-                with col2:
-                    if st.button("✏️ Edit", key=edit_key):
-                        override_category = st.text_input("Override Category", value=match['category'], key=f"cat_{uploaded_file.name}")
-                        override_retention = st.text_input("Override Retention Period", value=match['retention'], key=f"ret_{uploaded_file.name}")
-                        if st.button("💾 Save Edits", key=f"save_{uploaded_file.name}"):
-                            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            log_entries.append({
-                                "timestamp": timestamp,
-                                "document": uploaded_file.name,
-                                "predicted_category": match['category'],
-                                "predicted_retention": match['retention'],
-                                "override_category": override_category,
-                                "override_retention": override_retention,
-                                "confidence_level": level,
-                                "confidence_score": match['score'],
-                                "retention_schedule": retention_file.name
-                            })
-                            st.success(f"💾 Edited and saved for {uploaded_file.name}")
+                if col2.button("💾 Save Edits", key=f"save_{uploaded_file.name}"):
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    feedback_entry = {
+                        "timestamp": timestamp,
+                        "document": uploaded_file.name,
+                        "document_text": text.strip(),
+                        "original_category": match["category"],
+                        "original_retention": match["retention"],
+                        "override_category": override_category,
+                        "override_retention": override_retention,
+                        "confidence_level": level,
+                        "confidence_score": match["score"],
+                        "retention_schedule": retention_file.name
+                    }
+                    save_feedback_to_csv(feedback_entry)
+                    st.success(f"💾 Edited and saved for {uploaded_file.name}")
 
-        if log_entries:
-            log_df = pd.DataFrame(log_entries)
-            log_path = "results_log.csv"
-            if os.path.exists(log_path):
-                existing = pd.read_csv(log_path)
-                log_df = pd.concat([existing, log_df], ignore_index=True)
-            log_df.to_csv(log_path, index=False)
-            st.info(f"📁 Results saved to {log_path}")
-
-            # Download button
-            csv_bytes = log_df.to_csv(index=False).encode('utf-8')
+    # Allow download of feedback log
+    if os.path.exists("feedback_log.csv"):
+        with open("feedback_log.csv", "rb") as f:
             st.download_button(
-                label="⬇️ Download Results as CSV",
-                data=csv_bytes,
-                file_name="results_log.csv",
+                label="⬇️ Download All Feedback as CSV",
+                data=f,
+                file_name="feedback_log.csv",
                 mime="text/csv"
             )
 else:
