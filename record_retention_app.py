@@ -86,28 +86,35 @@ def load_feedback():
 # Match document text to best retention category
 def match_retention(text, rules_df, feedback_df=None):
     cleaned_text = text.strip()
+    doc_embedding = model.encode(cleaned_text, convert_to_tensor=True)
 
-    # Lookup override
+    # Try to find a similar prior feedback example
     if feedback_df is not None and not feedback_df.empty:
-        matched = feedback_df[feedback_df["document_text"] == cleaned_text]
-        if not matched.empty:
-            row = matched.iloc[-1]  # Use most recent feedback
+        feedback_texts = feedback_df["document_text"].tolist()
+        feedback_embeddings = model.encode(feedback_texts, convert_to_tensor=True)
+        similarities = util.cos_sim(doc_embedding, feedback_embeddings)[0]
+
+        # Find the best match
+        top_idx = similarities.argmax().item()
+        top_score = float(similarities[top_idx])
+
+        if top_score >= 0.80:
+            row = feedback_df.iloc[top_idx]
             return {
                 "category": row["override_category"],
-                "description": "User-verified category (from feedback)",
+                "description": f"User-verified category (matched by similarity {top_score:.2f})",
                 "retention": row["override_retention"],
                 "score": 1.0
             }
 
-    # Fallback to embedding similarity
-    doc_embedding = model.encode(text, convert_to_tensor=True)
-    rule_embeddings = model.encode(rules_df['category_description'].tolist(), convert_to_tensor=True)
+    # Fallback to normal embedding similarity with retention categories
+    rule_embeddings = model.encode(rules_df["category_description"].tolist(), convert_to_tensor=True)
     similarities = util.cos_sim(doc_embedding, rule_embeddings)[0]
     top_idx = similarities.argmax().item()
     return {
-        "category": rules_df.iloc[top_idx]['category_name'],
-        "description": rules_df.iloc[top_idx]['category_description'],
-        "retention": rules_df.iloc[top_idx]['retention_period'],
+        "category": rules_df.iloc[top_idx]["category_name"],
+        "description": rules_df.iloc[top_idx]["category_description"],
+        "retention": rules_df.iloc[top_idx]["retention_period"],
         "score": float(similarities[top_idx])
     }
 
