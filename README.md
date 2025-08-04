@@ -1,4 +1,4 @@
-# 🗃️ Washington Records Retention Assistant Ollama
+# 🗃️ Washington Records Retention Assistant
 
 A local, privacy-friendly app to help match public records to the appropriate retention schedules using semantic search and OCR.
 
